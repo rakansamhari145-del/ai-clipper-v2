@@ -1,290 +1,203 @@
-import json
-import os
-import re
-import tempfile
-import time
-import google.generativeai as genai
-from moviepy.editor import CompositeVideoClip, ImageClip, VideoFileClip
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
+import os
+import tempfile
+import json
+import google.generativeai as genai
+from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
+from PIL import Image, ImageDraw, ImageFont
 
-# Config Halaman Mobile Friendly
-st.set_page_config(
-    page_title="AI Video Clipper - Hook & Subtitle",
-    page_icon="🎬",
-    layout="centered",
-    initial_sidebar_state="expanded",
-)
-
+# ---------------------------------------------------------
+# SETUP & KONFIGURASI HALAMAN
+# ---------------------------------------------------------
+st.set_page_config(page_title="AI Video Clipper Mobile", page_icon="🎬", layout="centered")
 st.title("🎬 AI Video Clipper Mobile")
-st.write(
-    "Potong video horizontal menjadi klip vertikal (9:16) lengkap dengan"
-    " **Hook Banner** dan **Subtitle Otomatis**!"
-)
+st.write("Potong video horizontal menjadi klip vertikal (9:16) lengkap dengan **Hook Banner** dan **Subtitle Otomatis**!")
 
+# ---------------------------------------------------------
+# PEMBACAAN API KEY (OTOMATIS / MANUAL)
+# ---------------------------------------------------------
+st.sidebar.header("🔑 Pengaturan")
+api_key_input = st.sidebar.text_input("Gemini API Key", type="password", help="Masukkan API Key berawalan AIzaSy...")
 
-# Helper Function: Render Teks Hook & Subtitle dengan PIL
-def draw_styled_text(width, height, text, is_hook=False, font_size=26):
-  img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-  draw = ImageDraw.Draw(img)
+# Gunakan API Key dari input sidebar, atau otomatis ambil dari Secrets jika sidebar kosong
+api_key = api_key_input.strip() if api_key_input.strip() else st.secrets.get("GEMINI_API_KEY", "")
 
-  try:
-    font = ImageFont.load_default(size=font_size)
-  except Exception:
-    font = ImageFont.load_default()
+if not api_key:
+    st.warning("⚠️ Silakan masukkan Gemini API Key di menu samping (Sidebar) atau simpan di Streamlit Secrets!")
 
-  # Bungkus teks menjadi beberapa baris jika terlalu panjang
-  words = text.split()
-  lines = []
-  curr_line = []
-  max_chars = 16 if is_hook else 22
+# ---------------------------------------------------------
+# HELPER: RENDERING TEKS GAMBAR PIL (TANPA IMAGEMAGICK)
+# ---------------------------------------------------------
+def create_hook_banner(text, width=720, height=180):
+    """Membuat Banner Hook Kuning Teks Hitam"""
+    img = Image.new("RGBA", (width, height), (255, 220, 0, 230))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 36)
+    except:
+        font = ImageFont.load_default()
 
-  for w in words:
-    curr_line.append(w)
-    if len(" ".join(curr_line)) > max_chars:
-      if len(curr_line) > 1:
-        lines.append(" ".join(curr_line[:-1]))
-        curr_line = [w]
-      else:
-        lines.append(" ".join(curr_line))
-        curr_line = []
-  if curr_line:
-    lines.append(" ".join(curr_line))
+    # Dynamic Wrapping sederhananya
+    words = text.split()
+    lines, current = [], []
+    for w in words:
+        current.append(w)
+        bbox = draw.textbbox((0, 0), " ".join(current), font=font)
+        if (bbox[2] - bbox[0]) > (width - 40):
+            current.pop()
+            lines.append(" ".join(current))
+            current = [w]
+    if current:
+        lines.append(" ".join(current))
+    
+    full_text = "\n".join(lines)
+    bbox = draw.textmultilinebbox((0, 0), full_text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    
+    x = (width - text_w) // 2
+    y = (height - text_h) // 2
+    draw.multiline_text((x, y), full_text, fill="black", font=font, align="center")
+    
+    temp_path = tempfile.mktemp(suffix=".png")
+    img.save(temp_path)
+    return temp_path
 
-  full_text = "\n".join(lines)
+def create_subtitle_overlay(text, width=720, height=120):
+    """Membuat Subtitle Putih Outline Hitam Transparan"""
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 32)
+    except:
+        font = ImageFont.load_default()
 
-  bbox = draw.multiline_textbbox((0, 0), full_text, font=font, align="center")
-  text_w = bbox[2] - bbox[0]
-  text_h = bbox[3] - bbox[1]
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (width - text_w) // 2
+    y = (height - text_h) // 2
 
-  x = (width - text_w) // 2
+    # Draw Outline
+    for stroke_x in range(-2, 3):
+        for stroke_y in range(-2, 3):
+            draw.text((x + stroke_x, y + stroke_y), text, font=font, fill="black")
+    # Draw Main Text
+    draw.text((x, y), text, font=font, fill="yellow")
 
-  if is_hook:
-    y = int(height * 0.12)  # Posisi Hook di bagian atas
-  else:
-    y = int(height * 0.72)  # Posisi Subtitle di bagian bawah
+    temp_path = tempfile.mktemp(suffix=".png")
+    img.save(temp_path)
+    return temp_path
 
-  pad_x = 16
-  pad_y = 10
-  bg_box = [x - pad_x, y - pad_y, x + text_w + pad_x, y + text_h + pad_y]
+# ---------------------------------------------------------
+# GEMINI AI AUDIO ANALYSIS
+# ---------------------------------------------------------
+def analyze_audio_with_gemini(audio_path, key):
+    genai.configure(api_key=key)
+    audio_file = genai.upload_file(audio_path)
+    
+    prompt = """
+    Analisis audio berikut dan pilih 1 bagian paling seru/viral berdurasi 15-45 detik.
+    Berikan respon HANYA format JSON valid tanpa markdown backticks seperti ini:
+    {
+      "start_time": 10.5,
+      "end_time": 35.0,
+      "hook_text": "RAHASIA CEPAT CUAN DARI RUMAH!",
+      "subtitle": "Klip menarik tentang strategi bisnis digital"
+    }
+    """
+    
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    response = model.generate_content([audio_file, prompt])
+    
+    # Clean output
+    clean_json = response.text.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean_json)
 
-  if is_hook:
-    # Banner Hook: Kotak Kuning dengan Teks Hitam Tebal
-    draw.rounded_rectangle(bg_box, radius=12, fill=(255, 215, 0, 240))
-    draw.multiline_text(
-        (x, y), full_text, font=font, fill=(0, 0, 0, 255), align="center"
-    )
-  else:
-    # Subtitle: Kotak Transparan Gelap dengan Teks Kuning + Outline Hitam
-    draw.rounded_rectangle(bg_box, radius=10, fill=(0, 0, 0, 180))
-    for ox in range(-2, 3):
-      for oy in range(-2, 3):
-        draw.multiline_text(
-            (x + ox, y + oy),
-            full_text,
-            font=font,
-            fill=(0, 0, 0, 255),
-            align="center",
-        )
-    draw.multiline_text(
-        (x, y), full_text, font=font, fill=(255, 255, 0, 255), align="center"
-    )
+# ---------------------------------------------------------
+# MAIN INTERFACE
+# ---------------------------------------------------------
+uploaded_file = st.file_uploader("Pilih Video dari Galeri HP Anda", type=["mp4", "mov", "avi"])
 
-  return np.array(img)
+if uploaded_file:
+    # Simpan file sementara
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(uploaded_file.read())
+        video_path = tmp.name
 
+    clip = VideoFileClip(video_path)
+    st.video(video_path)
+    st.info(f"Durasi Video: {int(clip.duration)} detik")
 
-# Sidebar Pengaturan
-with st.sidebar:
-  st.header("⚙️ Pengaturan AI")
-  api_key = st.text_input(
-      "Gemini API Key",
-      type="password",
-      help="Dapatkan API Key gratis di aistudio.google.com",
-  )
+    if clip.duration > 300:
+        st.warning("⚠️ Video cukup panjang (>5 menit). Pemrosesan mungkin membutuhkan waktu lebih lama di Streamlit Cloud.")
 
-# Upload File Video
-uploaded_file = st.file_uploader(
-    "Pilih Video dari Galeri HP Anda", type=["mp4", "mov", "avi", "mkv"]
-)
+    if st.button("🚀 Potong Video + Hook + Subtitle"):
+        if not api_key:
+            st.error("Silakan masukkan API Key Gemini terlebih dahulu!")
+            st.stop()
 
-if uploaded_file is not None:
-  st.subheader("📹 Preview Video Asli")
-  st.video(uploaded_file)
+        status = st.status("Sedang memproses video...", expanded=True)
+        
+        try:
+            # 1. Ekstrak Audio saja agar upload ringan
+            status.write("🎵 Mengekstrak audio...")
+            audio_path = tempfile.mktemp(suffix=".mp3")
+            clip.audio.write_audiofile(audio_path, logger=None)
 
-  if st.button("🚀 Potong Video + Hook + Subtitle", use_container_width=True):
-    if not api_key:
-      st.error("⚠️ Silakan masukkan Gemini API Key di menu samping (Sidebar)!")
-    else:
-      try:
-        with st.status(
-            "Sedang memproses video dengan Gemini AI...", expanded=True
-        ) as status:
+            # 2. Kirim Audio ke Gemini
+            status.write("🧠 Menganalisis audio & menentukan klip terbaik dengan Gemini AI...")
+            ai_data = analyze_audio_with_gemini(audio_path, api_key)
+            
+            start_t = float(ai_data.get("start_time", 0))
+            end_t = min(float(ai_data.get("end_time", clip.duration)), clip.duration)
+            hook_text = ai_data.get("hook_text", "KLIP PILIHAN AI")
+            sub_text = ai_data.get("subtitle", "")
 
-          # 1. Simpan File Sementara
-          st.write("📁 Menyimpan file sementara...")
-          with tempfile.NamedTemporaryFile(
-              delete=False, suffix=".mp4"
-          ) as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            input_video_path = tmp_file.name
+            # 3. Potong Video & Format 9:16 Vertikal
+            status.write("✂️ Memotong video & menyesuaikan ukuran 9:16 (Vertikal)...")
+            subclip = clip.subclip(start_t, end_t)
+            
+            # Crop Center ke 9:16
+            w, h = subclip.size
+            target_w = int(h * (9 / 16))
+            if target_w < w:
+                crop_x1 = (w - target_w) // 2
+                subclip = subclip.crop(x1=crop_x1, width=target_w)
+            
+            subclip = subclip.resize(height=1280)  # Standard Vertical Height
 
-          audio_path = input_video_path + ".mp3"
-          output_clip_path = input_video_path + "_output.mp4"
+            # 4. Tambahkan Overlay Banner Hook & Subtitle
+            status.write("🎨 Menempelkan Hook Banner & Subtitle...")
+            hook_img = create_hook_banner(hook_text, width=subclip.w, height=180)
+            hook_clip = ImageClip(hook_img).set_duration(subclip.duration).set_position(("center", 100))
 
-          # 2. Ekstrak Audio
-          st.write("🎵 Mengekstrak audio dari video...")
-          video = VideoFileClip(input_video_path)
-          video.audio.write_audiofile(audio_path, logger=None)
-          video.close()
+            overlays = [subclip, hook_clip]
 
-          # 3. Analisis Audio + Buat Subtitle & Hook dengan Gemini AI
-          st.write("🧠 Menganalisis audio & membuat subtitle dengan Gemini AI...")
-          genai.configure(api_key=api_key)
+            if sub_text:
+                sub_img = create_subtitle_overlay(sub_text, width=subclip.w, height=120)
+                sub_overlay = ImageClip(sub_img).set_duration(subclip.duration).set_position(("center", subclip.h - 200))
+                overlays.append(sub_overlay)
 
-          uploaded_audio = genai.upload_file(audio_path)
+            final_video = CompositeVideoClip(overlays)
 
-          while uploaded_audio.state.name == "PROCESSING":
-            time.sleep(2)
-            uploaded_audio = genai.get_file(uploaded_audio.name)
+            # 5. Export Hasil
+            status.write("🎬 Menyusun video akhir...")
+            output_path = tempfile.mktemp(suffix=".mp4")
+            final_video.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=24, logger=None)
 
-          gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+            status.update(label="✅ Pemrosesan Selesai!", state="complete", expanded=False)
 
-          prompt = """
-                    Dengarkan audio berikut dengan seksama. 
-                    1. Pilih 1 bagian paling menarik/viral berdurasi 20 hingga 40 detik untuk dijadikan video Reels/TikTok.
-                    2. Buat judul HOOK singkat & menarik (max 6 kata) untuk dipasang di atas video.
-                    3. Buat daftar SUBTITLE lengkap khusus untuk bagian klip yang terpilih.
-                       Timestamp subtitle (start dan end) dihitung dalam DETIK RELATIF terhadap awal klip (dimulai dari 0 detik). Setiap baris subtitle berisi 3-6 kata.
+            # Tampilkan Hasil & Download
+            st.success(f"Hook: **{hook_text}**")
+            st.video(output_path)
 
-                    Tanggapi HANYA dengan format JSON valid berikut tanpa teks markdown/penjelasan tambahan:
-                    {
-                      "start": detik_mulai_audio_asli, 
-                      "end": detik_selesai_audio_asli, 
-                      "hook": "JUDUL HOOK VIRAL 😱", 
-                      "reason": "Alasan memilih bagian ini",
-                      "subtitles": [
-                        {"start": 0.0, "end": 2.5, "text": "Kata-kata subtitle pertama"},
-                        {"start": 2.5, "end": 5.0, "text": "Kata-kata subtitle kedua"}
-                      ]
-                    }
-                    """
+            with open(output_path, "rb") as file:
+                st.download_button(
+                    label="📥 Download Video Vertikal (9:16)",
+                    data=file,
+                    file_name="klip_viral_ai.mp4",
+                    mime="video/mp4"
+                )
 
-          response = gemini_model.generate_content([uploaded_audio, prompt])
-
-          try:
-            genai.delete_file(uploaded_audio.name)
-          except:
-            pass
-
-          clean_json = re.sub(r"```json|```", "", response.text).strip()
-          highlight = json.loads(clean_json)
-
-          st.write(
-              f"✨ **Hook Ditemukan:** {highlight.get('hook', 'Klip Viral')}"
-          )
-
-          # 4. Crop Video ke Format 9:16 Vertikal
-          st.write("✂️ Memotong & mengubah ukuran ke vertikal (9:16)...")
-          start_sec = float(highlight["start"])
-          end_sec = float(highlight["end"])
-
-          clip = VideoFileClip(input_video_path).subclip(start_sec, end_sec)
-
-          w, h = clip.size
-          crop_width = int(h * (9 / 16))
-
-          if crop_width < w:
-            x_center = w / 2
-            x1 = x_center - (crop_width / 2)
-            clip_cropped = clip.crop(x1=x1, width=crop_width, height=h)
-          else:
-            clip_cropped = clip
-
-          # 5. Pasang Overlay Hook & Subtitle
-          st.write("🎨 Menambahkan Banner Hook & Subtitle Otomatis...")
-          overlay_clips = []
-
-          # A. Hook Clip (Muncul 6 detik pertama)
-          hook_text = highlight.get("hook", "")
-          if hook_text:
-            hook_img = draw_styled_text(
-                crop_width, h, hook_text, is_hook=True, font_size=26
-            )
-            hook_dur = min(6.0, clip_cropped.duration)
-            hook_clip = (
-                ImageClip(hook_img, transparent=True)
-                .set_start(0)
-                .set_duration(hook_dur)
-            )
-            overlay_clips.append(hook_clip)
-
-          # B. Subtitle Clips (Muncul bergantian)
-          subtitles = highlight.get("subtitles", [])
-          for sub in subtitles:
-            s_text = sub.get("text", "").strip()
-            if not s_text:
-              continue
-            s_start = float(sub.get("start", 0))
-            s_end = float(sub.get("end", 0))
-
-            if s_start < clip_cropped.duration and s_end > s_start:
-              s_dur = min(s_end, clip_cropped.duration) - s_start
-              sub_img = draw_styled_text(
-                  crop_width, h, s_text, is_hook=False, font_size=24
-              )
-              sub_clip = (
-                  ImageClip(sub_img, transparent=True)
-                  .set_start(s_start)
-                  .set_duration(s_dur)
-              )
-              overlay_clips.append(sub_clip)
-
-          if overlay_clips:
-            final_clip = CompositeVideoClip([clip_cropped, *overlay_clips])
-          else:
-            final_clip = clip_cropped
-
-          # Render Video Akhir
-          final_clip.write_videofile(
-              output_clip_path,
-              codec="libx264",
-              audio_codec="aac",
-              temp_audiofile=input_video_path + "_temp_audio.m4a",
-              logger=None,
-          )
-
-          clip.close()
-          final_clip.close()
-
-          status.update(
-              label="🎉 Selesai memproses klip!",
-              state="complete",
-              expanded=False,
-          )
-
-        # Hasil Akhir
-        st.success("✅ Klip Berhasil Dibuat!")
-        st.subheader(f"🔥 {highlight.get('hook', 'Klip Hasil AI')}")
-        st.caption(f"💡 *{highlight.get('reason', '')}*")
-
-        with open(output_clip_path, "rb") as video_file:
-          video_bytes = video_file.read()
-          st.video(video_bytes)
-
-          st.download_button(
-              label="📥 Download Klip (Dengan Hook & Subtitle)",
-              data=video_bytes,
-              file_name="viral_clip_subtitle.mp4",
-              mime="video/mp4",
-              use_container_width=True,
-          )
-
-        # Bersihkan file sampah
-        for path in [input_video_path, audio_path, output_clip_path]:
-          if os.path.exists(path):
-            os.remove(path)
-
-      except Exception as e:
-        st.error(f"Terjadi kesalahan: {str(e)}")
-
+        except Exception as e:
+            status.update(label="❌ Terjadi Kesalahan", state="error")
+            st.error(f"Error: {str(e)}")
