@@ -2,10 +2,10 @@ import json
 import os
 import re
 import tempfile
+import time
 import google.generativeai as genai
 from moviepy.editor import VideoFileClip
 import streamlit as st
-import whisper
 
 # Config Halaman Mobile Friendly
 st.set_page_config(
@@ -18,7 +18,7 @@ st.set_page_config(
 st.title("🎬 AI Video Clipper Mobile")
 st.write(
     "Ubah video horizontal Anda menjadi klip vertikal (9:16) otomatis"
-    " menggunakan AI!"
+    " menggunakan Gemini AI!"
 )
 
 # Sidebar Pengaturan
@@ -28,12 +28,6 @@ with st.sidebar:
       "Gemini API Key",
       type="password",
       help="Dapatkan API Key gratis di aistudio.google.com",
-  )
-  whisper_model_type = st.selectbox(
-      "Ukuran Model Whisper (Akurasi)",
-      ["tiny", "base", "small"],
-      index=0,
-      help="'tiny' paling cepat, 'small' lebih akurat.",
   )
 
 # Upload File Video
@@ -50,7 +44,9 @@ if uploaded_file is not None:
       st.error("⚠️ Silakan masukkan Gemini API Key di menu samping (Sidebar)!")
     else:
       try:
-        with st.status("Sedang memproses video...", expanded=True) as status:
+        with st.status(
+            "Sedang memproses video dengan Gemini AI...", expanded=True
+        ) as status:
 
           # 1. Simpan File Sementara
           st.write("📁 Menyimpan file sementara...")
@@ -64,50 +60,51 @@ if uploaded_file is not None:
           output_clip_path = input_video_path + "_output.mp4"
 
           # 2. Ekstrak Audio
-          st.write("🎵 Mengambil audio dari video...")
+          st.write("🎵 Mengekstrak audio dari video...")
           video = VideoFileClip(input_video_path)
           video.audio.write_audiofile(audio_path, logger=None)
           video.close()
 
-          # 3. Transkripsi Audio
-          st.write(
-              f"🎙️ Mengubah suara ke teks dengan Whisper"
-              f" ({whisper_model_type})..."
-          )
-          model = whisper.load_model(whisper_model_type)
-          transcript_result = model.transcribe(audio_path)
-          segments = transcript_result["segments"]
-
-          # 4. Cari Momen Terbaik dengan Gemini AI
-          st.write("🧠 Menganalisis momen paling viral dengan Gemini AI...")
+          # 3. Menganalisis Audio Langsung dengan Gemini AI
+          st.write("🧠 Mengunggah & mendengarkan audio dengan Gemini AI...")
           genai.configure(api_key=api_key)
+
+          uploaded_audio = genai.upload_file(audio_path)
+
+          # Tunggu proses analisis audio jika perlu
+          while uploaded_audio.state.name == "PROCESSING":
+            time.sleep(2)
+            uploaded_audio = genai.get_file(uploaded_audio.name)
+
           gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
-          transcript_text = "\n".join([
-              f"{s['start']:.1f}s - {s['end']:.1f}s: {s['text']}"
-              for s in segments
-          ])
-
-          prompt = f"""
-                    Kamu adalah editor video viral. Berikut transkrip video beserta durasi:
-                    {transcript_text}
-
-                    Pilih 1 momen terbaik/paling menarik berdurasi 20-40 detik.
-                    Tanggapi HANYA dalam format JSON valid berikut tanpa teks markdown tambahan:
-                    {{"start": detik_mulai, "end": detik_selesai, "title": "Judul Klip", "reason": "Alasan memilih"}}
+          prompt = """
+                    Dengarkan audio berikut dengan seksama. 
+                    Pilih 1 bagian paling menarik/hook tinggi/viral berdurasi antara 20 hingga 40 detik untuk dijadikan video Shorts/Reels/TikTok.
+                    
+                    Tanggapi HANYA dengan format JSON valid berikut tanpa teks markdown/penjelasan tambahan:
+                    {"start": detik_mulai_float, "end": detik_selesai_float, "title": "Judul Klip", "reason": "Alasan memilih bagian ini"}
                     """
 
-          response = gemini_model.generate_content(prompt)
+          response = gemini_model.generate_content([uploaded_audio, prompt])
+
+          # Hapus file temporary dari server Gemini
+          try:
+            genai.delete_file(uploaded_audio.name)
+          except:
+            pass
+
           clean_json = re.sub(r"```json|```", "", response.text).strip()
           highlight = json.loads(clean_json)
 
           st.write(f"✨ **Momen Ditemukan:** {highlight.get('title')}")
 
-          # 5. Crop Video ke Format 9:16 Vertikal
+          # 4. Crop Video ke Format 9:16 Vertikal
           st.write("✂️ Memotong & mengubah ukuran ke vertikal (9:16)...")
-          clip = VideoFileClip(input_video_path).subclip(
-              highlight["start"], highlight["end"]
-          )
+          start_sec = float(highlight["start"])
+          end_sec = float(highlight["end"])
+
+          clip = VideoFileClip(input_video_path).subclip(start_sec, end_sec)
 
           w, h = clip.size
           crop_width = int(h * (9 / 16))
