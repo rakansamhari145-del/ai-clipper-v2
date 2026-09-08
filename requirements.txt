@@ -2,3 +2,4 @@ streamlit
 google-generativeai
 moviepy==1.0.3
 imageio-ffmpeg
+Pillow
